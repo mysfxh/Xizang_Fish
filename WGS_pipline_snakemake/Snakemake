@@ -1,0 +1,218 @@
+############################################
+# Snakefile (Single conda env, NO contig split)
+# FASTQ naming: {sample}_R1.fq.gz / {sample}_R2.fq.gz
+############################################
+
+#samples = [
+#  "CN-1","CN-2","CN-3","CN-4",
+#  "GN-1","GN-2","GN-3","GN-4",
+#  "GRC-2","GRC-3","GRC-8",
+#  "PC-1","PC-2","PC-3","PC-4",
+#  "ZGC-1","ZGC-2","ZGC-3","ZGC-4"
+#]
+#samples = ["XZQ"]
+
+
+samples = [ "CN-2", "CN-3","CN-1", "CN-4",
+    "GN-1", "GN-3",
+    "GRC-2", "GRC-3", "GRC-8",
+    "PC-1", "PC-2", "PC-3", "PC-4",
+    "ZGC-2","ZGC-3","ZGC-4"
+]
+genome = "./reference/HiC.review.assembly.chr.fa"
+bt2_index = "./reference/HiC.review.assembly.chr"   # bowtie2-build 前缀
+
+THREADS_MAX = 10
+JAVA_MEM = "12G"
+
+ENV = "envs/wgs.yml"
+
+rule all:
+  input:
+    expand("clean_fastq/{sample}_R1.fq.gz", sample=samples),
+    expand("clean_fastq/{sample}_R2.fq.gz", sample=samples),
+
+    expand("markdup_bam/{sample}_markdup.bam", sample=samples),
+    expand("markdup_bam/{sample}_markdup.bam.bai", sample=samples),
+
+    expand("gvcf/{sample}.g.vcf.gz", sample=samples),
+    expand("gvcf/{sample}.g.vcf.gz.tbi", sample=samples),
+
+    "vcf/all_sample.vcf.gz",
+    "vcf/all_sample.vcf.gz.tbi"
+
+
+############################################
+# 1) QC / trimming
+############################################
+rule QC:
+  conda: ENV
+  input:
+    r1="rawdata/{sample}_R1.fq.gz",
+    r2="rawdata/{sample}_R2.fq.gz"
+  output:
+    r1="clean_fastq/{sample}_R1.fq.gz",
+    r2="clean_fastq/{sample}_R2.fq.gz"
+  threads: 16
+  log:
+    html="clean_fastq/{sample}.fastp.html",
+    json="clean_fastq/{sample}.fastp.json"
+  shell:
+    """
+    fastp -w {threads} \
+      -i {input.r1} -I {input.r2} \
+      -o {output.r1} -O {output.r2} \
+      --detect_adapter_for_pe \
+      --html {log.html} --json {log.json}
+    """
+
+
+############################################
+# 2) Mapping (bowtie2) -> coordinate-sorted BAM
+############################################
+rule Bowtie2_map_sort:
+  conda: ENV
+  input:
+    r1="clean_fastq/{sample}_R1.fq.gz",
+    r2="clean_fastq/{sample}_R2.fq.gz"
+  output:
+    temp("sortedbam/{sample}.bam")
+  threads: THREADS_MAX
+  log:
+    "logs/bowtie2/{sample}.log"
+  shell:
+    r"""
+    set -euo pipefail
+    mkdir -p logs/bowtie2
+
+    bowtie2 -x {bt2_index} \
+      -1 {input.r1} -2 {input.r2} \
+      --rg-id {wildcards.sample} \
+      --rg SM:{wildcards.sample} \
+      --rg PL:ILLUMINA \
+      -p {threads} 2> {log} \
+    | samtools sort -@ {threads} -o {output} -
+    """
+
+
+############################################
+# 3) MarkDuplicates + index
+############################################
+rule MarkDuplicates:
+  input:
+    "sortedbam/{sample}.bam"
+  output:
+    bam="markdup_bam/{sample}_markdup.bam",
+    metrics="markdup_bam/{sample}.metrics.txt"
+  threads: 20
+  conda:
+    "gatk_env.yaml"
+  shell:
+    """
+    gatk --java-options "-Xmx{JAVA_MEM}" MarkDuplicates \
+      -I {input} \
+      -O {output.bam} \
+      -M {output.metrics}
+    """
+
+rule Index_markdup_bam:
+  conda: ENV
+  input:
+    "markdup_bam/{sample}_markdup.bam"
+  output:
+    "markdup_bam/{sample}_markdup.bam.bai"
+  threads: 8
+  shell:
+    """
+    samtools index -@ {threads} {input}
+    """
+
+
+############################################
+# 4) HaplotypeCaller -> per-sample gVCF
+############################################
+rule HaplotypeCaller_gvcf:
+  conda: ENV
+  input:
+    bam="markdup_bam/{sample}_markdup.bam",
+    bai="markdup_bam/{sample}_markdup.bam.bai"
+  output:
+    "gvcf/{sample}.g.vcf.gz"
+  threads: 8
+  log:
+    "logs/gatk_hc/{sample}.log"
+  shell:
+    """
+    set -euo pipefail
+    mkdir -p logs/gatk_hc
+
+    gatk --java-options "-Xmx{JAVA_MEM} -XX:ParallelGCThreads=8" HaplotypeCaller \
+      -R {genome} \
+      -I {input.bam} \
+      -O {output} \
+      -ERC GVCF \
+      > {log} 2>&1
+    """
+
+
+############################################
+# 5) Joint genotyping
+############################################
+rule Index_gvcf:
+  conda: ENV
+  input:
+    "gvcf/{sample}.g.vcf.gz"
+  output:
+    "gvcf/{sample}.g.vcf.gz.tbi"
+  shell:
+    "gatk IndexFeatureFile -I {input}"
+
+rule Combine_gvcf:
+  conda: ENV
+  input:
+    gvcfs=expand("gvcf/{sample}.g.vcf.gz", sample=samples),
+    tbis=expand("gvcf/{sample}.g.vcf.gz.tbi", sample=samples)
+  output:
+    "gvcf/all_sample.g.vcf.gz"
+  params:
+    vlist=lambda wc, input: " ".join([f"-V {x}" for x in input.gvcfs])
+  shell:
+    """
+    gatk --java-options "-Xmx{JAVA_MEM}" CombineGVCFs \
+      -R {genome} \
+      {params.vlist} \
+      -O {output}
+    """
+
+rule Index_all_gvcf:
+  conda: ENV
+  input:
+    "gvcf/all_sample.g.vcf.gz"
+  output:
+    "gvcf/all_sample.g.vcf.gz.tbi"
+  shell:
+    "gatk IndexFeatureFile -I {input}"
+
+rule Genotype_gvcf:
+  conda: ENV
+  input:
+    gvcf="gvcf/all_sample.g.vcf.gz",
+    tbi="gvcf/all_sample.g.vcf.gz.tbi"
+  output:
+    "vcf/all_sample.vcf.gz"
+  shell:
+    """
+    gatk --java-options "-Xmx{JAVA_MEM}" GenotypeGVCFs \
+      -R {genome} \
+      -V {input.gvcf} \
+      -O {output}
+    """
+
+rule Index_vcf:
+  conda: ENV
+  input:
+    "vcf/all_sample.vcf.gz"
+  output:
+    "vcf/all_sample.vcf.gz.tbi"
+  shell:
+    "gatk IndexFeatureFile -I {input}"
