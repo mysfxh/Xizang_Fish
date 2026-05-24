@@ -34,3 +34,41 @@ nohup bash -c "vcftools \
 --recode-INFO-all \
 --stdout | bgzip -c > fish.02_0.75.10filtered.vcf.gz" > fish.02_0.75.10filtered.log 2>&1 & 
 
+mkdir plink_result
+
+plink --vcf ../fish.02_0.75.10filtered.vcf.gz \
+  --allow-extra-chr \
+  --double-id \
+ --make-bed \
+  --out fish.02_0.75.10filtered
+# 1. 重新设置 SNP ID，避免重复 ID
+plink2 \
+  --bfile fish.02_0.75.10filtered\
+  --set-all-var-ids @:#\$r,\$a \
+  --new-id-max-allele-len 1000 truncate \
+  --make-bed \
+  --out fish.02_0.75.10filtered.unique
+
+
+# 2. 进行 LD pruning，生成 .prune.in 和 .prune.out
+plink \
+  --bfile fish.02_0.75.10filtered.unique \
+  --allow-extra-chr \
+  --indep-pairwise 100 1 0.8 \
+  --out fish.02_0.75.10filtered.unique.unique.100_1_0.8
+
+
+# 3. 提取 LD 过滤后保留下来的 SNP
+plink \
+  --bfile fish.02_0.75.10filtered.unique \
+  --allow-extra-chr \
+  --extract fish.02_0.75.10filtered.unique.unique.100_1_0.8.in \
+  --make-bed \
+  --out fish.02_0.75.10filtered.snapp.filtered.unique.100_1_0.8
+
+
+# 4. 把 LD 过滤后的数据导出为 VCF
+plink \
+  --bfile fish.02_0.75.10filtered.snapp.filtered.unique.100_1_0.8 \
+  --allow-extra-chr \
+  --recode vcf-iid bgz \
