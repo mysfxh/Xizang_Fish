@@ -503,90 +503,221 @@ log "=== 所有 MSMC2 输入文件准备完成 ==="
 
 
 
+
 #!/usr/bin/env bash
 set -euo pipefail
 
-INPUTDIR="/gpfs/home/21151/Fish/msmc2/Input"
-OUTDIR="/gpfs/home/21151/Fish/msmc2/results"
-MSMCTOOLS="/gpfs/home/21151/Fish/msmc2/msmc-tools-master"
+########################################
+# MSMC2 pairwise cross-population only
+# 不合并 multihetsep，直接传入每条染色体文件
+########################################
 
-THREADS=8
+INPUTDIR="/home/xiongh/2026/Fish/fitered/new_1/msmc2/input"
+OUTDIR="/home/xiongh/2026/Fish/fitered/new_1/msmc2/results"
+MSMCTOOLS="//home/xiongh/2026/Fish/fitered/new_1/msmc2/msmc-tools-master"
+
+MSMC2_BIN="msmc2_Linux"
+
+THREADS=100
+
+# 你的染色体范围
+CHR_LIST=($(seq 1 25))
 
 mkdir -p "${OUTDIR}"
 
 POPS=(L01 L02 L03 L04 L05 L06 L07 L08 L09 L10 L11 L12)
 
-# ========== 1. 单种群分析 ==========
-for POP in "${POPS[@]}"; do
-    infile="${INPUTDIR}/${POP}.multihetsep.txt"
-    outfile="${OUTDIR}/${POP}.final.txt"
+WITHIN_POP1_INDICES="0,1,2,3"
+WITHIN_POP2_INDICES="4,5,6,7"
+CROSS_INDICES="0-4,0-5,0-6,0-7,1-4,1-5,1-6,1-7,2-4,2-5,2-6,2-7,3-4,3-5,3-6,3-7"
 
-    if [[ -s "$outfile" ]]; then
-        echo "[SKIP] ${POP} already finished: $outfile"
-        continue
-    fi
+########################################
+# Check commands and files
+########################################
 
-    if [[ ! -s "$infile" ]]; then
-        echo "[ERROR] input file not found or empty: $infile" >&2
-        exit 1
-    fi
+command -v "${MSMC2_BIN}" >/dev/null 2>&1 || {
+    echo "[ERROR] 找不到 ${MSMC2_BIN}，请确认 msmc2_Linux 在 PATH 中" >&2
+    exit 1
+}
 
-    echo "Running MSMC2 for ${POP}..."
-    msmc2_Linux -t "${THREADS}" -o "${OUTDIR}/${POP}" "$infile"
+command -v python3 >/dev/null 2>&1 || {
+    echo "[ERROR] 找不到 python3" >&2
+    exit 1
+}
 
-    if [[ ! -s "$outfile" ]]; then
-        echo "[ERROR] MSMC2 failed, final file not generated: $outfile" >&2
-        exit 1
-    fi
-done
+if [[ ! -f "${MSMCTOOLS}/combineCrossCoal.py" ]]; then
+    echo "[ERROR] 找不到 combineCrossCoal.py: ${MSMCTOOLS}/combineCrossCoal.py" >&2
+    exit 1
+fi
 
-# ========== 2. Cross-population 分析 ==========
-for i in "${!POPS[@]}"; do
-    for j in $(seq $((i+1)) 11); do
+########################################
+# Pairwise cross-population MSMC2
+########################################
+
+echo "========== Pairwise cross-population MSMC2 only =========="
+echo "Input mode: per-chromosome multihetsep files, not merged"
+
+for ((i=0; i<${#POPS[@]}; i++)); do
+    for ((j=i+1; j<${#POPS[@]}; j++)); do
+
         POP1="${POPS[$i]}"
         POP2="${POPS[$j]}"
+        PAIR="${POP1}_${POP2}"
 
-        infile="${INPUTDIR}/${POP1}_${POP2}.multihetsep.txt"
-        cross_final="${OUTDIR}/${POP1}_${POP2}.final.txt"
-        pop1_final="${OUTDIR}/${POP1}.final.txt"
-        pop2_final="${OUTDIR}/${POP2}.final.txt"
-        combined="${OUTDIR}/${POP1}_${POP2}.combined.txt"
+        # 收集每条染色体文件，保持 LG1, LG2, ..., LG25 顺序
+        input_files=()
+        for chr in "${CHR_LIST[@]}"; do
+            f="${INPUTDIR}/${PAIR}.LG${chr}.multihetsep.txt"
+            if [[ ! -s "$f" ]]; then
+                echo "[ERROR] pair chromosome input file not found or empty: $f" >&2
+                exit 1
+            fi
+            input_files+=("$f")
+        done
 
-        if [[ -s "$combined" ]]; then
-            echo "[SKIP] ${POP1}_${POP2} already combined: $combined"
+        prefix_within1="${OUTDIR}/${PAIR}.within_${POP1}"
+        prefix_within2="${OUTDIR}/${PAIR}.within_${POP2}"
+        prefix_across="${OUTDIR}/${PAIR}.across"
+
+        within1_final="${prefix_within1}.final.txt"
+        within2_final="${prefix_within2}.final.txt"
+        across_final="${prefix_across}.final.txt"
+
+        combined="${OUTDIR}/${PAIR}.combined.txt"
+        donefile="${OUTDIR}/${PAIR}.combined.done"
+
+        if [[ -s "$donefile" && -s "$combined" ]]; then
+            echo "[SKIP] ${PAIR} already combined: ${combined}"
             continue
         fi
 
-        if [[ ! -s "$infile" ]]; then
-            echo "[ERROR] cross input file not found or empty: $infile" >&2
-            exit 1
+        echo
+        echo "========== Running pair: ${PAIR} =========="
+        echo "  input files: ${#input_files[@]} chromosomes"
+        echo "  first input: ${input_files[0]}"
+        echo "  last input:  ${input_files[-1]}"
+
+        ########################################
+        # 1. within POP1
+        ########################################
+
+        if [[ ! -s "$within1_final" ]]; then
+            echo "Running within ${POP1} for ${PAIR}"
+            echo "  -I: ${WITHIN_POP1_INDICES}"
+            echo "  output: ${prefix_within1}"
+
+            rm -f \
+                "${prefix_within1}.final.txt" \
+                "${prefix_within1}.loop.txt" \
+                "${prefix_within1}.log" \
+                "${prefix_within1}.stdout.log" \
+                "${prefix_within1}.stderr.log"
+
+            /usr/bin/time -v "${MSMC2_BIN}" \
+                -t "${THREADS}" \
+                -I "${WITHIN_POP1_INDICES}" \
+                -o "${prefix_within1}" \
+                "${input_files[@]}" \
+                > "${prefix_within1}.stdout.log" \
+                2> "${prefix_within1}.stderr.log"
+
+            if [[ ! -s "$within1_final" ]]; then
+                echo "[ERROR] MSMC2 failed: ${within1_final}" >&2
+                echo "Check log: ${prefix_within1}.stderr.log" >&2
+                exit 1
+            fi
+        else
+            echo "[SKIP] within ${POP1} exists: ${within1_final}"
         fi
 
-        echo "Running MSMC2 for ${POP1}_vs_${POP2}..."
+        ########################################
+        # 2. within POP2
+        ########################################
 
-        msmc2_Linux -t "${THREADS}" \
-            -I 0-4,0-5,0-6,0-7,1-4,1-5,1-6,1-7,2-4,2-5,2-6,2-7,3-4,3-5,3-6,3-7 \
-            -o "${OUTDIR}/${POP1}_${POP2}" \
-            "$infile"
+        if [[ ! -s "$within2_final" ]]; then
+            echo "Running within ${POP2} for ${PAIR}"
+            echo "  -I: ${WITHIN_POP2_INDICES}"
+            echo "  output: ${prefix_within2}"
 
-        if [[ ! -s "$cross_final" ]]; then
-            echo "[ERROR] MSMC2 failed, cross final file not generated: $cross_final" >&2
-            exit 1
+            rm -f \
+                "${prefix_within2}.final.txt" \
+                "${prefix_within2}.loop.txt" \
+                "${prefix_within2}.log" \
+                "${prefix_within2}.stdout.log" \
+                "${prefix_within2}.stderr.log"
+
+            /usr/bin/time -v "${MSMC2_BIN}" \
+                -t "${THREADS}" \
+                -I "${WITHIN_POP2_INDICES}" \
+                -o "${prefix_within2}" \
+                "${input_files[@]}" \
+                > "${prefix_within2}.stdout.log" \
+                2> "${prefix_within2}.stderr.log"
+
+            if [[ ! -s "$within2_final" ]]; then
+                echo "[ERROR] MSMC2 failed: ${within2_final}" >&2
+                echo "Check log: ${prefix_within2}.stderr.log" >&2
+                exit 1
+            fi
+        else
+            echo "[SKIP] within ${POP2} exists: ${within2_final}"
         fi
 
-        if [[ ! -s "$pop1_final" || ! -s "$pop2_final" ]]; then
-            echo "[ERROR] single-pop final file missing for combineCrossCoal:" >&2
-            echo "        $pop1_final" >&2
-            echo "        $pop2_final" >&2
-            exit 1
+        ########################################
+        # 3. across POP1-POP2
+        ########################################
+
+        if [[ ! -s "$across_final" ]]; then
+            echo "Running across ${POP1}-${POP2}"
+            echo "  -I: ${CROSS_INDICES}"
+            echo "  output: ${prefix_across}"
+
+            rm -f \
+                "${prefix_across}.final.txt" \
+                "${prefix_across}.loop.txt" \
+                "${prefix_across}.log" \
+                "${prefix_across}.stdout.log" \
+                "${prefix_across}.stderr.log"
+
+            /usr/bin/time -v "${MSMC2_BIN}" \
+                -t "${THREADS}" \
+                -I "${CROSS_INDICES}" \
+                -o "${prefix_across}" \
+                "${input_files[@]}" \
+                > "${prefix_across}.stdout.log" \
+                2> "${prefix_across}.stderr.log"
+
+            if [[ ! -s "$across_final" ]]; then
+                echo "[ERROR] MSMC2 failed: ${across_final}" >&2
+                echo "Check log: ${prefix_across}.stderr.log" >&2
+                exit 1
+            fi
+        else
+            echo "[SKIP] across exists: ${across_final}"
         fi
+
+        ########################################
+        # 4. combineCrossCoal
+        ########################################
+
+        echo "Combining cross-coalescence for ${PAIR}"
 
         python3 "${MSMCTOOLS}/combineCrossCoal.py" \
-            "$cross_final" \
-            "$pop1_final" \
-            "$pop2_final" \
-            > "$combined"
+            "${across_final}" \
+            "${within1_final}" \
+            "${within2_final}" \
+            > "${combined}"
+
+        if [[ ! -s "$combined" ]]; then
+            echo "[ERROR] combineCrossCoal failed: ${combined}" >&2
+            exit 1
+        fi
+
+        touch "${donefile}"
+        echo "[OK] ${PAIR} combined: ${combined}"
+
     done
 done
 
-echo "All MSMC2 analyses completed!"
+echo
+echo "All pairwise cross-population MSMC2 analyses completed!"
