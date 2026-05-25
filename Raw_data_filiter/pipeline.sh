@@ -62,7 +62,7 @@ plink \
 plink \
   --bfile fish.02_0.75.10filtered.unique \
   --allow-extra-chr \
-  --extract fish.02_0.75.10filtered.unique.unique.100_1_0.8.in \
+  --extract fish.02_0.75.10filtered.unique.unique.100_1_0.8.prune.in \
   --make-bed \
   --out fish.02_0.75.10filtered.snapp.filtered.unique.100_1_0.8
 
