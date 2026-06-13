@@ -1,78 +1,74 @@
- #!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-#############################################
-# ADMIXTOOLS / qpDstat workflow for fish
-# 12 lake populations + TO outgroup
+############################################################
+# Resume ADMIXTOOLS / qpDstat workflow
+# 目的：
+#   1. 尽量复用已经生成的 VCF，避免从头重跑
+#   2. 去除非染色体位点，如 Scaffold19
+#   3. 只保留 LG 主染色体或数字染色体
+#   4. 继续完成 PLINK -> convertf -> qpDstat -> qp3Pop -> 作图
 #
-# Analyses:
-# 1. VCF -> PLINK -> EIGENSTRAT
-# 2. qpDstat: D(A, B; C, TO)
-# 3. qp3Pop: f3(Target; Source1, Source2)
-# 4. Optional qpF4ratio if f4_models.tsv is provided
-# 5. Plot Dstat and f3 results
-#############################################
+# 注意：
+#   OUTDIR 虽然叫 Dsuite，但本脚本运行的是 ADMIXTOOLS：
+#   convertf / qpDstat / qp3Pop / qpF4ratio
+############################################################
 
-#############################################
-# 1. 你已经修改好的路径
-#############################################
+############################
+# 1. 输入路径
+############################
 
-# 输入 VCF：不需要 LD pruning
-VCF="/media/server/Elements/BC2026040063-BN260407NJ01S02N5-134个异尾高原鳅重测序数据变异分析/gvcf_joint/snapp_filter_missing075/fish.02_missing075.DP10.MAF005.vcf.gz"
+ORIGINAL_VCF="/media/server/Elements/BC2026040063-BN260407NJ01S02N5-134个异尾高原鳅重测序数据变异分析/gvcf_joint/snapp_filter_missing075/fish.02_missing075.DP10.MAF005.vcf.gz"
 
-# 你的三列表格，格式：
-# sample_id    sample_id    population
 POPMAP3="/media/server/Elements/BC2026040063-BN260407NJ01S02N5-134个异尾高原鳅重测序数据变异分析/gvcf_joint/snapp_filter_missing075/plink_result/population_table.txt"
 
-# 输出目录
-# 注意：目录名字叫 Dsuite 没关系，但这个脚本运行的是 qpDstat / qp3Pop / qpF4ratio，不是 Dsuite
 OUTDIR="/media/server/Elements/BC2026040063-BN260407NJ01S02N5-134个异尾高原鳅重测序数据变异分析/gvcf_joint/Dsuite"
 
-#############################################
+############################
 # 2. 分析参数
-#############################################
+############################
 
-# 12 个湖泊群体
+# 12 个湖泊群体，不包括外群 TO
 LAKE_POPS="BC CEND CN GN GRC MJC PC QCG SLC YC YQC ZGC"
 
 # 外群
 OUTGROUP="TO"
 
 # ADMIXTOOLS block size
-# 练习中是 0.01；WGS 数据先用 0.01 可以，后续可测试 0.05
 BLGSIZE=0.01
 
-# 输出前缀
-PREFIX="fish_admix"
+# 新前缀，避免和之前包含 Scaffold 的 fish_admix 混淆
+PREFIX="fish_admix_noScaffold"
 
-#############################################
-# 3. 不需要修改
-#############################################
+# 如果想强制重跑所有步骤：
+# FORCE=1 bash run_qpDstat_resume_noScaffold.sh
+FORCE="${FORCE:-0}"
 
 mkdir -p "$OUTDIR"
 cd "$OUTDIR"
 
 echo
-echo "============================================="
-echo "ADMIXTOOLS / qpDstat workflow"
-echo "VCF: $VCF"
-echo "POPMAP3: $POPMAP3"
-echo "OUTDIR: $OUTDIR"
-echo "Lake populations: $LAKE_POPS"
-echo "Outgroup: $OUTGROUP"
-echo "Block size: $BLGSIZE"
-echo "============================================="
+echo "===================================================="
+echo "Resume ADMIXTOOLS / qpDstat workflow"
+echo "ORIGINAL_VCF: $ORIGINAL_VCF"
+echo "POPMAP3:      $POPMAP3"
+echo "OUTDIR:       $OUTDIR"
+echo "Lake pops:    $LAKE_POPS"
+echo "Outgroup:     $OUTGROUP"
+echo "Prefix:       $PREFIX"
+echo "FORCE:        $FORCE"
+echo "===================================================="
 echo
 
-#############################################
-# Step 0. Check tools
-#############################################
+############################################################
+# Step 0. Check files and tools
+############################################################
 
 echo "========== Step 0: check files and tools =========="
 
-if [[ ! -s "$VCF" ]]; then
-    echo "[ERROR] VCF not found:"
-    echo "$VCF"
+if [[ ! -s "$ORIGINAL_VCF" ]]; then
+    echo "[ERROR] Original VCF not found:"
+    echo "$ORIGINAL_VCF"
     exit 1
 fi
 
@@ -96,64 +92,21 @@ else
     echo "[WARNING] qpF4ratio not found. Optional f4-ratio step will be skipped."
 fi
 
-echo "[OK] all required tools found."
-
-#############################################
-# Step 1. Rename chromosomes
-# LG1 -> 1, LG2 -> 2
-#############################################
-
-echo
-echo "========== Step 1: rename chromosomes =========="
-
-VCF_RENAME="${OUTDIR}/fish.02_missing075.DP10.MAF005.chrnum.vcf.gz"
-CHR_MAP="${OUTDIR}/chr.rename.txt"
-
-if [[ ! -s "${VCF}.tbi" && ! -s "${VCF}.csi" ]]; then
-    echo "[WARNING] VCF index not found. Building index..."
-    tabix -f -p vcf "$VCF"
-fi
-
-bcftools query -f '%CHROM\n' "$VCF" | sort -V | uniq | \
-awk '
-{
-    old=$1;
-    new=old;
-
-    if (new ~ /^LG[0-9]+$/) {
-        sub(/^LG/, "", new);
-    } else if (new ~ /^[Cc]hr[0-9]+$/) {
-        sub(/^[Cc]hr/, "", new);
-        new = new + 0;
-    }
-
-    print old"\t"new;
-}' > "$CHR_MAP"
-
-echo "Chromosome rename table:"
-cat "$CHR_MAP"
-
-if [[ ! -s "$VCF_RENAME" ]]; then
-    bcftools annotate \
-      --rename-chrs "$CHR_MAP" \
-      -Oz -o "$VCF_RENAME" \
-      "$VCF"
-
-    tabix -f -p vcf "$VCF_RENAME"
+if command -v Rscript >/dev/null 2>&1; then
+    HAS_R="yes"
 else
-    echo "[SKIP] renamed VCF already exists:"
-    echo "$VCF_RENAME"
+    HAS_R="no"
+    echo "[WARNING] Rscript not found. Plotting step will be skipped."
 fi
 
-echo "[OK] renamed VCF:"
-echo "$VCF_RENAME"
+echo "[OK] files and tools checked."
 
-#############################################
-# Step 2. Make two-column popmap and keep list
-#############################################
+############################################################
+# Step 1. Make two-column popmap and keep list
+############################################################
 
 echo
-echo "========== Step 2: make popmap and keep list =========="
+echo "========== Step 1: make popmap and keep list =========="
 
 POPMAP2="${OUTDIR}/fish_12lakes_TO.popmap2.txt"
 KEEP="${OUTDIR}/fish_12lakes_TO.keep.txt"
@@ -166,7 +119,6 @@ BEGIN {
 NF >= 3 {
     sample=$1;
     pop=$3;
-
     if (pop == outgroup || pop in keep) {
         print sample, pop;
     }
@@ -175,118 +127,322 @@ NF >= 3 {
 
 awk '{print $1}' "$POPMAP2" > "$KEEP"
 
+sort "$KEEP" > keep.samples.txt
+
 echo "[OK] two-column popmap:"
 echo "$POPMAP2"
 
 echo
-echo "Population counts:"
+echo "[INFO] Population counts:"
 awk '{count[$2]++} END{for(p in count) print p, count[p]}' "$POPMAP2" | sort
 
-#############################################
-# Step 3. Check sample names
-#############################################
+############################################################
+# Step 2. Choose existing VCF to avoid rerunning
+############################################################
 
 echo
-echo "========== Step 3: check sample names =========="
+echo "========== Step 2: choose existing VCF =========="
 
-bcftools query -l "$VCF_RENAME" | sort > vcf.samples.txt
-sort "$KEEP" > keep.samples.txt
+FINAL_VCF="${OUTDIR}/${PREFIX}.biallelicSNP.vcf.gz"
 
-comm -23 keep.samples.txt vcf.samples.txt > samples_in_popmap_not_in_vcf.txt
-comm -13 keep.samples.txt vcf.samples.txt > samples_in_vcf_not_in_popmap.txt
+SOURCE_VCF=""
 
-if [[ -s samples_in_popmap_not_in_vcf.txt ]]; then
-    echo "[ERROR] 以下 popmap 样本不在 VCF 中："
-    cat samples_in_popmap_not_in_vcf.txt
-    exit 1
+if [[ -s "$FINAL_VCF" && "$FORCE" != "1" ]]; then
+    echo "[SKIP] Final no-Scaffold VCF already exists:"
+    echo "$FINAL_VCF"
+else
+    CANDIDATE_VCFS=(
+        "${OUTDIR}/fish_admix.biallelicSNP.vcf.gz"
+        "${OUTDIR}/fish.02_missing075.DP10.MAF005.onlyLG.chrnum.vcf.gz"
+        "${OUTDIR}/fish.02_missing075.DP10.MAF005.chrnum.vcf.gz"
+        "${OUTDIR}/fish.02_missing075.DP10.MAF005.onlyLG.vcf.gz"
+        "$ORIGINAL_VCF"
+    )
+
+    for f in "${CANDIDATE_VCFS[@]}"; do
+        if [[ -s "$f" ]]; then
+            echo "[INFO] Found candidate VCF:"
+            echo "$f"
+
+            if [[ ! -s "${f}.tbi" && ! -s "${f}.csi" ]]; then
+                echo "[INFO] Index not found. Indexing candidate VCF..."
+                tabix -f -p vcf "$f"
+            fi
+
+            bcftools query -l "$f" | sort > candidate.vcf.samples.txt
+
+            comm -23 keep.samples.txt candidate.vcf.samples.txt > candidate.missing.samples.txt
+
+            if [[ -s candidate.missing.samples.txt ]]; then
+                echo "[WARNING] Candidate VCF misses some required samples. Skip this VCF."
+                head candidate.missing.samples.txt
+            else
+                SOURCE_VCF="$f"
+                echo "[OK] Selected source VCF:"
+                echo "$SOURCE_VCF"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$SOURCE_VCF" ]]; then
+        echo "[ERROR] No suitable VCF found."
+        exit 1
+    fi
 fi
 
-echo "[OK] all popmap samples are present in VCF."
-
-if [[ -s samples_in_vcf_not_in_popmap.txt ]]; then
-    echo "[WARNING] 以下 VCF 样本不在本次分析中，将被剔除："
-    cat samples_in_vcf_not_in_popmap.txt
-fi
-
-#############################################
-# Step 4. Prepare VCF
-# 不做 LD pruning
-#############################################
+############################################################
+# Step 3. Remove non-chromosome contigs and create final VCF
+############################################################
 
 echo
-echo "========== Step 4: prepare VCF for ADMIXTOOLS =========="
+echo "========== Step 3: remove non-chromosome contigs =========="
 
-VCF_ADMIX="${OUTDIR}/${PREFIX}.biallelicSNP.vcf.gz"
+if [[ ! -s "$FINAL_VCF" || "$FORCE" == "1" ]]; then
 
-if [[ ! -s "$VCF_ADMIX" ]]; then
+    bcftools query -f '%CHROM\n' "$SOURCE_VCF" | sort -V | uniq > source.chroms.txt
+
+    echo "[INFO] Chromosomes/contigs in selected source VCF:"
+    cat source.chroms.txt
+
+    MODE=""
+
+    if grep -Eq '^LG[0-9]+$' source.chroms.txt; then
+        MODE="LG"
+        grep -E '^LG[0-9]+$' source.chroms.txt > keep.chroms.txt
+    elif grep -Eq '^[0-9]+$' source.chroms.txt; then
+        MODE="NUMERIC"
+        grep -E '^[0-9]+$' source.chroms.txt > keep.chroms.txt
+    else
+        echo "[ERROR] No LG or numeric chromosomes found in source VCF."
+        echo "Your VCF chromosomes are:"
+        cat source.chroms.txt
+        exit 1
+    fi
+
+    echo
+    echo "[INFO] Chromosome mode: $MODE"
+    echo "[INFO] Chromosomes retained:"
+    cat keep.chroms.txt
+
+    CHRS_CSV=$(paste -sd, keep.chroms.txt)
+
+    TMP_KEEP="${OUTDIR}/${PREFIX}.tmp.keepchrom.vcf.gz"
+    TMP_CHRNUM="${OUTDIR}/${PREFIX}.tmp.chrnum.vcf.gz"
+    CHR_RENAME="${OUTDIR}/${PREFIX}.chr.rename.txt"
+
+    rm -f "$TMP_KEEP" "$TMP_KEEP.tbi" "$TMP_CHRNUM" "$TMP_CHRNUM.tbi" "$FINAL_VCF" "$FINAL_VCF.tbi"
+
+    if [[ "$MODE" == "LG" ]]; then
+        echo "[INFO] Keeping only LG chromosomes..."
+        bcftools view \
+          -r "$CHRS_CSV" \
+          -Oz -o "$TMP_KEEP" \
+          "$SOURCE_VCF"
+
+        tabix -f -p vcf "$TMP_KEEP"
+
+        echo "[INFO] Renaming LG chromosomes to numeric..."
+        awk '{
+            old=$1;
+            new=old;
+            sub(/^LG/, "", new);
+            print old"\t"new;
+        }' keep.chroms.txt > "$CHR_RENAME"
+
+        bcftools annotate \
+          --rename-chrs "$CHR_RENAME" \
+          -Oz -o "$TMP_CHRNUM" \
+          "$TMP_KEEP"
+
+        tabix -f -p vcf "$TMP_CHRNUM"
+
+    else
+        echo "[INFO] Keeping only numeric chromosomes..."
+        bcftools view \
+          -r "$CHRS_CSV" \
+          -Oz -o "$TMP_CHRNUM" \
+          "$SOURCE_VCF"
+
+        tabix -f -p vcf "$TMP_CHRNUM"
+    fi
+
+    echo "[INFO] Chromosomes after removing non-chromosome contigs:"
+    bcftools query -f '%CHROM\n' "$TMP_CHRNUM" | sort -n | uniq
+
+    echo
+    echo "[INFO] Checking sample names after chromosome filtering..."
+    bcftools query -l "$TMP_CHRNUM" | sort > tmp.vcf.samples.txt
+    comm -23 keep.samples.txt tmp.vcf.samples.txt > samples_in_popmap_not_in_vcf.txt
+
+    if [[ -s samples_in_popmap_not_in_vcf.txt ]]; then
+        echo "[ERROR] These popmap samples are not in the selected VCF:"
+        cat samples_in_popmap_not_in_vcf.txt
+        exit 1
+    fi
+
+    echo "[INFO] Creating final biallelic SNP VCF for ADMIXTOOLS..."
     bcftools view \
       -S "$KEEP" \
       -m2 -M2 -v snps \
-      -Oz -o "$VCF_ADMIX" \
-      "$VCF_RENAME"
+      -Oz -o "$FINAL_VCF" \
+      "$TMP_CHRNUM"
 
-    tabix -f -p vcf "$VCF_ADMIX"
+    tabix -f -p vcf "$FINAL_VCF"
+
 else
-    echo "[SKIP] ADMIXTOOLS VCF already exists:"
-    echo "$VCF_ADMIX"
+    echo "[SKIP] Final no-Scaffold VCF exists:"
+    echo "$FINAL_VCF"
+
+    if [[ ! -s "${FINAL_VCF}.tbi" && ! -s "${FINAL_VCF}.csi" ]]; then
+        tabix -f -p vcf "$FINAL_VCF"
+    fi
 fi
 
-echo "Sample number:"
-bcftools query -l "$VCF_ADMIX" | wc -l
-
-echo "SNP number:"
-bcftools view -H "$VCF_ADMIX" | wc -l
-
-#############################################
-# Step 5. VCF to PLINK binary
-#############################################
+echo
+echo "[OK] Final VCF used for ADMIXTOOLS:"
+echo "$FINAL_VCF"
 
 echo
-echo "========== Step 5: VCF to PLINK =========="
+echo "[INFO] Final VCF chromosomes:"
+bcftools query -f '%CHROM\n' "$FINAL_VCF" | sort -n | uniq
 
-plink \
-  --vcf "$VCF_ADMIX" \
-  --make-bed \
-  --out "$PREFIX" \
-  --double-id \
-  --allow-extra-chr \
-  --snps-only just-acgt \
-  --biallelic-only strict \
-  --noweb
+echo
+echo "[INFO] Final VCF sample number:"
+bcftools query -l "$FINAL_VCF" | wc -l
 
-# 修正 .bim 中 SNP ID，避免 . 或重复 ID 影响 convertf
-awk 'BEGIN{OFS="\t"} {$2=$1":"$4":"$5":"$6":"NR; print}' "${PREFIX}.bim" > "${PREFIX}.bim.tmp"
-mv "${PREFIX}.bim.tmp" "${PREFIX}.bim"
+echo "[INFO] Final VCF SNP number:"
+bcftools view -H "$FINAL_VCF" | wc -l
 
-echo "[OK] PLINK files generated:"
+############################################################
+# Step 4. VCF to PLINK binary
+############################################################
+
+echo
+echo "========== Step 4: VCF to PLINK =========="
+
+if [[ "$FORCE" == "1" || ! -s "${PREFIX}.bed" || ! -s "${PREFIX}.bim" || ! -s "${PREFIX}.fam" ]]; then
+
+    rm -f ${PREFIX}.bed ${PREFIX}.bim ${PREFIX}.fam ${PREFIX}.log ${PREFIX}.nosex
+
+    plink \
+      --vcf "$FINAL_VCF" \
+      --make-bed \
+      --out "$PREFIX" \
+      --double-id \
+      --allow-extra-chr \
+      --snps-only just-acgt \
+      --biallelic-only strict \
+      --noweb
+
+else
+    echo "[SKIP] PLINK files already exist:"
+    ls -lh ${PREFIX}.bed ${PREFIX}.bim ${PREFIX}.fam
+fi
+
+echo "[OK] PLINK files:"
 ls -lh ${PREFIX}.bed ${PREFIX}.bim ${PREFIX}.fam
 
-#############################################
-# Step 6. PLINK to EIGENSTRAT
-#############################################
+############################################################
+# Step 5. Clean BIM for convertf
+############################################################
+
+echo
+echo "========== Step 5: clean BIM for convertf =========="
+
+awk 'BEGIN{OFS="\t"} {
+    $2 = "snp_" NR;
+    $3 = 0;
+    print $1,$2,$3,$4,$5,$6
+}' "${PREFIX}.bim" > "${PREFIX}.bim.clean"
+
+mv "${PREFIX}.bim.clean" "${PREFIX}.bim"
+
+echo "[INFO] First 10 rows of cleaned BIM:"
+head "${PREFIX}.bim"
+
+BAD_CHR_COUNT=$(awk '$1 !~ /^[0-9]+$/ {c++} END{print c+0}' "${PREFIX}.bim")
+
+if [[ "$BAD_CHR_COUNT" -gt 0 ]]; then
+    echo "[ERROR] Non-numeric chromosome names still exist in BIM:"
+    awk '$1 !~ /^[0-9]+$/ {print; if(++n==20) exit}' "${PREFIX}.bim"
+    exit 1
+fi
+
+echo "[OK] All chromosomes in BIM are numeric."
+
+echo
+echo "[INFO] Chromosome counts in BIM:"
+awk '{count[$1]++} END{for(c in count) print c, count[c]}' "${PREFIX}.bim" | sort -n
+
+############################################################
+# Step 6. convertf PLINK to EIGENSTRAT
+############################################################
 
 echo
 echo "========== Step 6: convertf PLINK to EIGENSTRAT =========="
 
-cat > convert.par <<EOF
+if [[ "$FORCE" == "1" || ! -s "${PREFIX}.geno" || ! -s "${PREFIX}.snp" || ! -s "${PREFIX}.ind" ]]; then
+
+    rm -f ${PREFIX}.geno ${PREFIX}.snp ${PREFIX}.ind convertf.log
+
+    cat > convert.par <<EOF
 genotypename:    ${PREFIX}.bed
 snpname:         ${PREFIX}.bim
 indivname:       ${PREFIX}.fam
+inputformat:     PACKEDPED
 outputformat:    EIGENSTRAT
 genotypeoutname: ${PREFIX}.geno
 snpoutname:      ${PREFIX}.snp
 indivoutname:    ${PREFIX}.ind
 familynames:     NO
+numchrom:        100
 EOF
 
-convertf -p convert.par > convertf.log 2>&1
+    echo "[INFO] convert.par:"
+    cat convert.par
 
-echo "[OK] EIGENSTRAT files:"
+    set +e
+    convertf -p convert.par > convertf.log 2>&1
+    CONVERT_STATUS=$?
+    set -e
+
+    if [[ "$CONVERT_STATUS" -ne 0 ]]; then
+        echo "[WARNING] convertf EIGENSTRAT failed. Showing convertf.log:"
+        tail -n 80 convertf.log
+
+        echo
+        echo "[INFO] Retrying with PACKEDANCESTRYMAP..."
+
+        rm -f ${PREFIX}.geno ${PREFIX}.snp ${PREFIX}.ind convertf.log
+
+        cat > convert.par <<EOF
+genotypename:    ${PREFIX}.bed
+snpname:         ${PREFIX}.bim
+indivname:       ${PREFIX}.fam
+inputformat:     PACKEDPED
+outputformat:    PACKEDANCESTRYMAP
+genotypeoutname: ${PREFIX}.geno
+snpoutname:      ${PREFIX}.snp
+indivoutname:    ${PREFIX}.ind
+familynames:     NO
+numchrom:        100
+EOF
+
+        convertf -p convert.par > convertf.log 2>&1
+    fi
+
+else
+    echo "[SKIP] ADMIXTOOLS files already exist:"
+    ls -lh ${PREFIX}.geno ${PREFIX}.snp ${PREFIX}.ind
+fi
+
+echo "[OK] ADMIXTOOLS files:"
 ls -lh ${PREFIX}.geno ${PREFIX}.snp ${PREFIX}.ind
 
-#############################################
+############################################################
 # Step 7. Fix .ind population column
-#############################################
+############################################################
 
 echo
 echo "========== Step 7: fix .ind population labels =========="
@@ -310,7 +466,7 @@ echo "[OK] fixed ind file:"
 echo "${PREFIX}.ind.new"
 
 echo
-echo "Population counts in .ind.new:"
+echo "[INFO] Population counts in .ind.new:"
 awk '{count[$3]++} END{for(p in count) print p, count[p]}' "${PREFIX}.ind.new" | sort
 
 if grep -q "Ignore" "${PREFIX}.ind.new"; then
@@ -318,10 +474,10 @@ if grep -q "Ignore" "${PREFIX}.ind.new"; then
     grep "Ignore" "${PREFIX}.ind.new" | head
 fi
 
-#############################################
+############################################################
 # Step 8. Generate listD
 # D(A, B; C, TO)
-#############################################
+############################################################
 
 echo
 echo "========== Step 8: generate listD =========="
@@ -342,12 +498,12 @@ print("[OK] listD generated")
 print("Number of D-stat tests:", sum(1 for _ in open("listD")))
 PY
 
-echo "First 10 listD rows:"
+echo "[INFO] First 10 rows of listD:"
 head listD
 
-#############################################
+############################################################
 # Step 9. Run qpDstat
-#############################################
+############################################################
 
 echo
 echo "========== Step 9: run qpDstat =========="
@@ -361,13 +517,17 @@ printsd:      YES
 blgsize:      ${BLGSIZE}
 EOF
 
-qpDstat -p parD > Dstat.out
+if [[ "$FORCE" == "1" || ! -s "Dstat.out" ]]; then
+    qpDstat -p parD > Dstat.out
+else
+    echo "[SKIP] Dstat.out already exists."
+fi
 
 echo "[OK] qpDstat finished."
 
-#############################################
+############################################################
 # Step 10. Extract Dstat table
-#############################################
+############################################################
 
 echo
 echo "========== Step 10: extract Dstat table =========="
@@ -408,13 +568,12 @@ echo "${OUTDIR}/Dstat.table.significance"
 echo "${OUTDIR}/Dstat.table.sorted_by_absZ"
 
 echo
-echo "Top 30 D-stat results:"
+echo "[INFO] Top 30 D-stat results:"
 head -n 31 Dstat.table.sorted_by_absZ
 
-#############################################
-# Step 11. Generate listF3
-# f3(Target; Source1, Source2)
-#############################################
+############################################################
+# Step 11. Generate listF3 and run qp3Pop
+############################################################
 
 echo
 echo "========== Step 11: run qp3Pop =========="
@@ -443,7 +602,11 @@ printsd:      YES
 blgsize:      ${BLGSIZE}
 EOF
 
-qp3Pop -p parF3 > F3.out
+if [[ "$FORCE" == "1" || ! -s "F3.out" ]]; then
+    qp3Pop -p parF3 > F3.out
+else
+    echo "[SKIP] F3.out already exists."
+fi
 
 (echo "target source1 source2 f3 stderr Z NSNP"; \
 grep "result" F3.out | awk '{print $2,$3,$4,$5,$6,$7,$8}') > F3.table || true
@@ -467,16 +630,9 @@ echo "[OK] qp3Pop output:"
 echo "${OUTDIR}/F3.table"
 echo "${OUTDIR}/F3.table.significance"
 
-#############################################
+############################################################
 # Step 12. Optional qpF4ratio
-# 只有存在 f4_models.tsv 时才运行
-#
-# f4_models.tsv 五列：
-# RefA  Outgroup  Target  SourceB  SourceA
-#
-# 自动转换为：
-# RefA Outgroup : Target SourceB :: RefA Outgroup : SourceA SourceB
-#############################################
+############################################################
 
 echo
 echo "========== Step 12: optional qpF4ratio =========="
@@ -511,12 +667,11 @@ EOF
 
 else
     echo "[SKIP] No f4_models.tsv found or qpF4ratio unavailable."
-    echo "如果后续要做 f4-ratio，请在 OUTDIR 下新建 f4_models.tsv。"
 fi
 
-#############################################
-# Step 13. Plot Dstat, F3, and optional F4ratio
-#############################################
+############################################################
+# Step 13. Plot results
+############################################################
 
 echo
 echo "========== Step 13: plot results =========="
@@ -524,18 +679,20 @@ echo "========== Step 13: plot results =========="
 PLOTDIR="${OUTDIR}/plots"
 mkdir -p "$PLOTDIR"
 
+if [[ "$HAS_R" == "yes" ]]; then
+
 cat > plot_admixtools_results.R <<'RSCRIPT'
 #!/usr/bin/env Rscript
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("ggplot2 is not installed. Please install.packages('ggplot2').")
+}
 
 suppressPackageStartupMessages({
   library(ggplot2)
 })
 
 plotdir <- "plots"
-
-#############################################
-# Plot Dstat
-#############################################
 
 if (file.exists("Dstat.table")) {
 
@@ -593,15 +750,12 @@ if (file.exists("Dstat.table")) {
   )
 }
 
-#############################################
-# Plot f3
-#############################################
-
 if (file.exists("F3.table")) {
 
   f3 <- read.table("F3.table", header = TRUE, stringsAsFactors = FALSE)
 
   if (nrow(f3) > 0) {
+
     f3$f3 <- as.numeric(f3$f3)
     f3$stderr <- as.numeric(f3$stderr)
     f3$Z <- as.numeric(f3$Z)
@@ -650,10 +804,6 @@ if (file.exists("F3.table")) {
   }
 }
 
-#############################################
-# Plot optional F4ratio
-#############################################
-
 if (file.exists("F4ratio.table")) {
 
   f4 <- read.table("F4ratio.table", header = TRUE, stringsAsFactors = FALSE)
@@ -699,20 +849,29 @@ if (file.exists("F4ratio.table")) {
 }
 RSCRIPT
 
-Rscript plot_admixtools_results.R
+    Rscript plot_admixtools_results.R
+    echo "[OK] plots saved in: $PLOTDIR"
 
-echo "[OK] Plots saved in:"
-echo "${PLOTDIR}"
+else
+    echo "[SKIP] Rscript not found. Plotting skipped."
+fi
+
+############################################################
+# Done
+############################################################
 
 echo
-echo "========== All done =========="
+echo "===================================================="
+echo "All done."
 echo "Main outputs:"
+echo "$FINAL_VCF"
 echo "${OUTDIR}/Dstat.table"
 echo "${OUTDIR}/Dstat.table.significance"
 echo "${OUTDIR}/Dstat.table.sorted_by_absZ"
 echo "${OUTDIR}/F3.table"
 echo "${OUTDIR}/F3.table.significance"
-echo "${PLOTDIR}/Dstat_plot.pdf"
-echo "${PLOTDIR}/Dstat_plot.png"
-echo "${PLOTDIR}/F3_plot.pdf"
-echo "${PLOTDIR}/F3_plot.png"
+echo "${OUTDIR}/plots/Dstat_plot.pdf"
+echo "${OUTDIR}/plots/Dstat_plot.png"
+echo "${OUTDIR}/plots/F3_plot.pdf"
+echo "${OUTDIR}/plots/F3_plot.png"
+echo "===================================================="
